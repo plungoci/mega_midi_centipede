@@ -5,11 +5,28 @@
 #define TOTAL_PINS 64
 
 // -------- MIDI settings --------
-const uint8_t MIDI_CHANNEL = 1;     // 1..16
-const uint8_t NOTE_BASE = 36;       // button 0 = MIDI note 36
+const uint8_t MIDI_CHANNEL = 1;        // 1..16
+const uint8_t CC_BASE = 16;            // first CC number in bank 0, normal layer
+const uint8_t BANK_COUNT = 4;          // number of CC banks
+const uint8_t LAYER_CC_OFFSET = 64;    // shift layer CC offset (normal + 64)
+const uint8_t CC_ON_VALUE = 127;       // value sent when toggle turns ON
+const uint8_t CC_OFF_VALUE = 0;        // value sent when toggle turns OFF
 
-// -------- debounce settings --------
+// -------- debounce and hold settings --------
 const unsigned long DEBOUNCE_MS = 20;
+const unsigned long LONG_PRESS_MS = 550;
+
+// -------- matrix layout --------
+const uint8_t MATRIX_ROWS = 8;
+const uint8_t MATRIX_COLS = 8;
+
+// -------- special buttons in matrix --------
+const uint8_t BANK_BUTTON_INDEX = 56;   // row 7, col 0
+const uint8_t SHIFT_BUTTON_INDEX = 57;  // row 7, col 1
+
+// -------- optional local LED feedback --------
+const int8_t BANK_LED_PIN = -1;
+const int8_t SHIFT_LED_PIN = LED_BUILTIN;
 
 // -------- MCP storage --------
 Adafruit_MCP23X17 mcp[MAX_MCP];
@@ -19,22 +36,110 @@ uint8_t mcpCount = 0;
 // -------- button state --------
 bool rawState[TOTAL_PINS];
 bool stableState[TOTAL_PINS];
-bool lastStableState[TOTAL_PINS];
 unsigned long lastChangeTime[TOTAL_PINS];
+unsigned long pressStartTime[TOTAL_PINS];
+bool longPressHandled[TOTAL_PINS];
+
+// -------- controller logic --------
+bool toggleState[TOTAL_PINS];
+bool ledState[TOTAL_PINS];
+uint8_t activeBank = 0;
+bool shiftLayerMomentary = false;
+bool shiftLayerLatched = false;
 
 // --------------------------------------------------
-// MIDI send helpers
+// MIDI send helpers (CC mode)
 // --------------------------------------------------
-void midiSendNoteOn(uint8_t note, uint8_t velocity, uint8_t channel) {
-  Serial1.write(0x90 | ((channel - 1) & 0x0F));
-  Serial1.write(note & 0x7F);
-  Serial1.write(velocity & 0x7F);
+void midiSendCC(uint8_t cc, uint8_t value, uint8_t channel) {
+  Serial1.write(0xB0 | ((channel - 1) & 0x0F));
+  Serial1.write(cc & 0x7F);
+  Serial1.write(value & 0x7F);
 }
 
-void midiSendNoteOff(uint8_t note, uint8_t velocity, uint8_t channel) {
-  Serial1.write(0x80 | ((channel - 1) & 0x0F));
-  Serial1.write(note & 0x7F);
-  Serial1.write(velocity & 0x7F);
+// --------------------------------------------------
+// Utility helpers
+// --------------------------------------------------
+bool isShiftLayerActive() {
+  return shiftLayerMomentary || shiftLayerLatched;
+}
+
+uint8_t matrixToLinear(uint8_t row, uint8_t col) {
+  return (row * MATRIX_COLS) + col;
+}
+
+uint8_t getCCNumberForButton(uint8_t buttonIndex) {
+  uint8_t row = buttonIndex / MATRIX_COLS;
+  uint8_t col = buttonIndex % MATRIX_COLS;
+
+  // matrix-style performance layout with serpentine rows
+  uint8_t matrixIndex;
+  if ((row & 0x01) == 0) {
+    matrixIndex = matrixToLinear(row, col);
+  } else {
+    matrixIndex = matrixToLinear(row, (MATRIX_COLS - 1) - col);
+  }
+
+  uint8_t cc = CC_BASE + matrixIndex + (activeBank * TOTAL_PINS);
+  if (isShiftLayerActive()) {
+    cc += LAYER_CC_OFFSET;
+  }
+  return cc & 0x7F;
+}
+
+void updateHardwareLedIndicators() {
+  if (BANK_LED_PIN >= 0) {
+    // pulse pattern by bank parity
+    digitalWrite(BANK_LED_PIN, (activeBank & 0x01) ? HIGH : LOW);
+  }
+  if (SHIFT_LED_PIN >= 0) {
+    digitalWrite(SHIFT_LED_PIN, isShiftLayerActive() ? HIGH : LOW);
+  }
+}
+
+void setButtonLed(uint8_t buttonIndex, bool on) {
+  ledState[buttonIndex] = on;
+  // Hook for external LED hardware if present.
+}
+
+void refreshAllButtonLeds() {
+  for (uint8_t i = 0; i < TOTAL_PINS; i++) {
+    setButtonLed(i, toggleState[i]);
+  }
+  updateHardwareLedIndicators();
+}
+
+void handleBankSwitch() {
+  activeBank = (activeBank + 1) % BANK_COUNT;
+  Serial.print("Bank changed to ");
+  Serial.println(activeBank);
+
+  // refresh feedback for active bank/layer
+  refreshAllButtonLeds();
+}
+
+void handleShiftLongPress() {
+  shiftLayerLatched = !shiftLayerLatched;
+  Serial.print("Shift layer latch: ");
+  Serial.println(shiftLayerLatched ? "ON" : "OFF");
+  refreshAllButtonLeds();
+}
+
+void handlePerformanceToggle(uint8_t buttonIndex) {
+  toggleState[buttonIndex] = !toggleState[buttonIndex];
+  setButtonLed(buttonIndex, toggleState[buttonIndex]);
+
+  uint8_t cc = getCCNumberForButton(buttonIndex);
+  uint8_t value = toggleState[buttonIndex] ? CC_ON_VALUE : CC_OFF_VALUE;
+  midiSendCC(cc, value, MIDI_CHANNEL);
+
+  Serial.print("Button ");
+  Serial.print(buttonIndex);
+  Serial.print(" toggled ");
+  Serial.print(toggleState[buttonIndex] ? "ON" : "OFF");
+  Serial.print(" -> CC ");
+  Serial.print(cc);
+  Serial.print(" value ");
+  Serial.println(value);
 }
 
 // --------------------------------------------------
@@ -108,21 +213,27 @@ void setupInputs() {
     bool state = mcp[chip].digitalRead(localPin);
     rawState[i] = state;
     stableState[i] = state;
-    lastStableState[i] = state;
     lastChangeTime[i] = 0;
+    pressStartTime[i] = 0;
+    longPressHandled[i] = false;
+    toggleState[i] = false;
+    ledState[i] = false;
   }
 
   // mark non-existing pins as released
   for (uint8_t i = availablePins; i < TOTAL_PINS; i++) {
     rawState[i] = HIGH;
     stableState[i] = HIGH;
-    lastStableState[i] = HIGH;
     lastChangeTime[i] = 0;
+    pressStartTime[i] = 0;
+    longPressHandled[i] = false;
+    toggleState[i] = false;
+    ledState[i] = false;
   }
 }
 
 // --------------------------------------------------
-// Scan + debounce + MIDI
+// Scan + debounce + toggle/CC handling
 // --------------------------------------------------
 void scanButtons() {
   uint8_t availablePins = mcpCount * 16;
@@ -144,24 +255,40 @@ void scanButtons() {
       if (stableState[i] != rawState[i]) {
         stableState[i] = rawState[i];
 
-        uint8_t note = NOTE_BASE + i;
-
-        // active low button
+        // active-low buttons
         if (stableState[i] == LOW) {
-          midiSendNoteOn(note, 127, MIDI_CHANNEL);
-          Serial.print("Button ");
-          Serial.print(i);
-          Serial.print(" pressed -> Note ON ");
-          Serial.println(note);
-        } else {
-          midiSendNoteOff(note, 0, MIDI_CHANNEL);
-          Serial.print("Button ");
-          Serial.print(i);
-          Serial.print(" released -> Note OFF ");
-          Serial.println(note);
-        }
+          pressStartTime[i] = now;
+          longPressHandled[i] = false;
 
-        lastStableState[i] = stableState[i];
+          if (i == SHIFT_BUTTON_INDEX) {
+            shiftLayerMomentary = true;
+            updateHardwareLedIndicators();
+            Serial.println("Shift (momentary) ON");
+          } else if (i == BANK_BUTTON_INDEX) {
+            handleBankSwitch();
+          } else {
+            handlePerformanceToggle(i);
+          }
+        } else {
+          // release
+          if (i == SHIFT_BUTTON_INDEX) {
+            shiftLayerMomentary = false;
+            updateHardwareLedIndicators();
+            Serial.println("Shift (momentary) OFF");
+          }
+          longPressHandled[i] = false;
+          pressStartTime[i] = 0;
+        }
+      }
+    }
+
+    // long-press detection while held
+    if ((stableState[i] == LOW) && !longPressHandled[i] && (pressStartTime[i] != 0)) {
+      if ((now - pressStartTime[i]) >= LONG_PRESS_MS) {
+        if (i == SHIFT_BUTTON_INDEX) {
+          handleShiftLongPress();
+        }
+        longPressHandled[i] = true;
       }
     }
   }
@@ -170,6 +297,13 @@ void scanButtons() {
 void setup() {
   Serial.begin(115200);   // debug to Serial Monitor
   Serial1.begin(31250);   // MIDI OUT on TX1 (pin 18)
+
+  if (BANK_LED_PIN >= 0) {
+    pinMode(BANK_LED_PIN, OUTPUT);
+  }
+  if (SHIFT_LED_PIN >= 0) {
+    pinMode(SHIFT_LED_PIN, OUTPUT);
+  }
 
   Wire.begin();           // Mega uses SDA=20, SCL=21
   delay(200);
@@ -186,8 +320,9 @@ void setup() {
   }
 
   setupInputs();
+  refreshAllButtonLeds();
 
-  Serial.println("Ready.");
+  Serial.println("Ready (Toggle + CC + Banks + Shift + Matrix layout).");
 }
 
 void loop() {
